@@ -1,0 +1,32 @@
+{
+  "42": {
+    "seed": 42,
+    "stm_documents": 3483,
+    "topics": 20,
+    "vocabulary_terms": 11265,
+    "regression_documents": 3251,
+    "source_model": "STM/Local/Result/42/42.RData",
+    "source_md5": "4b1d31ded58c018048dcd094ac69c718",
+    "id_scope": "Within each seed, Doc_ID is the retained STM document identifier shared with aligned metadata. Source_Row_ID preserves the original input row; excluded metadata rows have no Doc_ID."
+  },
+  "2024": {
+    "seed": 2024,
+    "stm_documents": 3484,
+    "topics": 20,
+    "vocabulary_terms": 11327,
+    "regression_documents": 3292,
+    "source_model": "STM/Local/Result/2024/2024.RData",
+    "source_md5": "9f4d3b57e40b431a10179f3e4aa1aa7b",
+    "id_scope": "Within each seed, Doc_ID is the retained STM document identifier shared with aligned metadata. Source_Row_ID preserves the original input row; excluded metadata rows have no Doc_ID."
+  },
+  "12345": {
+    "seed": 12345,
+    "stm_documents": 3485,
+    "topics": 20,
+    "vocabulary_terms": 11349,
+    "regression_documents": 3293,
+    "source_model": "STM/Local/Result/12345/12345.RData",
+    "source_md5": "02f9375b2f06a9608d11baa5e1b3c562",
+    "id_scope": "Within each seed, Doc_ID is the retained STM document identifier shared with aligned metadata. Source_Row_ID preserves the original input row; excluded metadata rows have no Doc_ID."
+  }
+}

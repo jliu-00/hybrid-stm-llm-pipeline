@@ -1,0 +1,1493 @@
+# ==============================================================================
+# Research Project: Hybride Inhaltsanalyse mit Structural Topic Models und Large Language Models am Beispiel chinesischsprachiger Medien außerhalb Festlandchinas
+# Main Analysis Pipeline (End-to-End Empirical Analysis: Preprocessing, STM, Validation Integration, Regression, and Visualizations)
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# Step 0: Environment Setup (Install and Load R Packages)
+# ------------------------------------------------------------------------------
+library(tidyverse) # Data manipulation and visualization
+library(stm)       # Core STM package
+library(tm)        # Text mining utilities
+library(jiebaR)    # Chinese word segmentation
+library(here)      # File path resolution
+library(showtext)  # Chinese font handling
+library(readxl)    # Reading Excel files
+library(writexl)   # Writing Excel files
+library(scales)    # Chart axis formatting
+library(ggeffects) # Marginal effect predictions
+library(broom)     # Model tidying
+library(irr)       # Krippendorff's Alpha inter-coder reliability
+
+# --- Font Setup ---
+# Load font file to ensure Chinese characters render correctly in plots.
+# Configurable via variable 'font_path' or environment variable 'FONT_PATH'.
+if (!exists("font_path", inherits = FALSE)) {
+  font_candidates <- c(
+    Sys.getenv("FONT_PATH", unset = ""),
+    file.path("..", "..", "environment", "song.ttf"),
+    file.path("environment", "song.ttf")
+  )
+  font_candidates <- font_candidates[nzchar(font_candidates) & file.exists(font_candidates)]
+  font_path <- if (length(font_candidates) > 0) normalizePath(font_candidates[1]) else "song.ttf"
+}
+if (file.exists(font_path)) {
+  font_add("song", regular = font_path)
+  showtext_auto()
+  print(paste("Song typeface successfully loaded from:", font_path))
+} else {
+  warning("Font file not found at '", font_path, "'. Chinese characters in plots may not display correctly.")
+}
+
+# --- German Display Labels and Formatting Helper Functions ---
+funding_labels_de <- c(
+  "Other Sources" = "Medien mit anderen Finanzierungsquellen",
+  "Foreign Gov-Affiliated" = "Staatlich bzw. öffentlich finanzierte Medien"
+)
+
+covariate_labels_de <- function(x) {
+  x <- str_replace_all(x, fixed("Funding_SourcesForeign Gov-Affiliated"),
+                       paste0("Finanzierungsgruppe: ", funding_labels_de[["Foreign Gov-Affiliated"]]))
+  x <- str_replace_all(x, fixed("Funding_SourcesOther Sources"),
+                       paste0("Finanzierungsgruppe: ", funding_labels_de[["Other Sources"]]))
+  x <- str_replace_all(x, fixed("Is_Taiwan1"), "Taiwan-Medium (ja)")
+  x <- str_replace_all(x, fixed("(Intercept)"), "Konstante")
+  str_replace_all(x, "Topic_(\\d+)", "Themenanteil \\1")
+}
+
+print_model_de <- function(x) {
+  output <- capture.output(print(x))
+  labels <- c(
+    "Top Words:" = "Wichtigste Wörter:",
+    "Highest Prob:" = "Höchste Wortwahrscheinlichkeit:",
+    "FREX:" = "FREX (Häufigkeit und Exklusivität):",
+    "Lift:" = "Relative Überrepräsentation:",
+    "Score:" = "Bewertungswert:",
+    "Call:" = "Modellaufruf:", "Residuals:" = "Residuen:",
+    "Coefficients:" = "Koeffizienten:", "Estimate" = "Schätzwert",
+    "Std. Error" = "Standardfehler", "t value" = "t-Wert",
+    "Pr(>|t|)" = "p-Wert", "Signif. codes:" = "Signifikanzcodes:",
+    "Residual standard error:" = "Residualstandardfehler:",
+    "degrees of freedom" = "Freiheitsgrade",
+    "Multiple R-squared:" = "Bestimmtheitsmaß R²:",
+    "Adjusted R-squared:" = "Korrigiertes R²:",
+    "F-statistic:" = "F-Statistik:", "p-value:" = "p-Wert:",
+    " DF" = " Freiheitsgrade",
+    "Median" = "Median", "1Q" = "1. Quartil", "3Q" = "3. Quartil"
+  )
+  for (label in names(labels)) {
+    output <- str_replace_all(output, fixed(label), labels[[label]])
+  }
+  output <- str_replace_all(output, "Topic ([0-9]+)", "Thema \\1")
+  output <- str_replace_all(output, "\\bon ([0-9]+)", "bei \\1")
+  output <- str_replace_all(output, "\\band ([0-9]+)", "und \\1")
+  cat(paste(covariate_labels_de(output), collapse = "\n"), "\n")
+  invisible(x)
+}
+
+# ------------------------------------------------------------------------------
+# Step 0.5: Define Paths and Output Directory
+# ------------------------------------------------------------------------------
+# Supports dynamic specification of seeds (defaults to 42; supports 2024, 12345, etc.)
+if (!exists("current_seed", inherits = FALSE)) {
+  current_seed <- "42"
+}
+
+# Configurable base directory for full-text corpus and model execution.
+# Can be set prior to sourcing/rendering or via environment variable 'STM_BASE_DIR'.
+if (!exists("base_dir", inherits = FALSE)) {
+  env_base <- Sys.getenv("STM_BASE_DIR", unset = "")
+  if (nzchar(env_base)) {
+    base_dir <- env_base
+  } else {
+    candidates <- c(
+      file.path("..", "..", "STM"),
+      file.path("STM"),
+      getwd()
+    )
+    found_base <- candidates[dir.exists(candidates)]
+    base_dir <- if (length(found_base) > 0) normalizePath(found_base[1]) else getwd()
+  }
+}
+
+local_dir <- file.path(base_dir, "Local")
+results_dir <- if (dir.exists(local_dir)) file.path(local_dir, "Result", current_seed) else file.path(base_dir, "Result", current_seed)
+if (!dir.exists(results_dir)) {
+  dir.create(results_dir, recursive = TRUE)
+}
+print(paste("Current analysis seed:", current_seed))
+print(paste("Base directory:", base_dir))
+print(paste("Results will be saved to:", results_dir))
+
+# Search for the downsampled full-text dataset across standard directory layouts
+data_candidates <- c(
+  file.path(local_dir, "data", paste0("downsampled_dataset_seed_", current_seed, ".csv")),
+  file.path(base_dir, "Downsampled", "data", paste0("downsampled_dataset_seed_", current_seed, ".csv")),
+  file.path(base_dir, "data", paste0("downsampled_dataset_seed_", current_seed, ".csv")),
+  file.path(base_dir, paste0("downsampled_dataset_seed_", current_seed, ".csv"))
+)
+found_data <- data_candidates[file.exists(data_candidates)]
+
+if (length(found_data) > 0) {
+  data_path <- normalizePath(found_data[1])
+} else {
+  stop(
+    "Data file not found for seed ", current_seed, ".\n",
+    "Hinweis gemaess Urheberrechtsgesetz (UrhG § 60d): Geschuetzte Volltextkorpora sind nicht ",
+    "im oeffentlichen Replikationspaket enthalten.\n",
+    "Fuer eine Neuschaetzung setzen Sie bitte vorab 'base_dir <- \"/Pfad/zu/Ihren/Volltexten\"' ",
+    "oder die Umgebungsvariable 'STM_BASE_DIR'. Gesuchte Pfade:\n  - ",
+    paste(data_candidates, collapse = "\n  - ")
+  )
+}
+
+# ------------------------------------------------------------------------------
+# Step 1: Load and Clean Raw Data (Continuation of Python Global Cleaning)
+# ------------------------------------------------------------------------------
+# Load downsampled primary sample data (Seed 42)
+all_articles_raw <- read_csv(data_path, col_types = cols(.default = "c"))
+
+all_articles <- all_articles_raw %>%
+  rename(
+    Title = `News Title`,
+    Text = `News Content`,
+    Funding_Sources = `Funding Source`
+  ) %>%
+  mutate(
+    # Standardize funding source category labels
+    Funding_Sources = case_when(
+      Funding_Sources == "Foreign Government" ~ "Foreign Gov-Affiliated",
+      Funding_Sources == "Independent Media" ~ "Other Sources",
+      TRUE ~ Funding_Sources
+    ),
+    Is_Taiwan = ifelse(grepl("Taiwan|台湾", `Media Region`, ignore.case = TRUE), 1, 0)
+  )
+
+# Force covariates to factors and explicitly set baseline levels (control group as 0)
+all_articles$Funding_Sources <- factor(all_articles$Funding_Sources, levels = c("Other Sources", "Foreign Gov-Affiliated"))
+all_articles$Is_Taiwan <- as.factor(all_articles$Is_Taiwan)
+
+print("Data loading and covariate factorization complete.")
+print(paste("Total sample size:", nrow(all_articles), "articles; Taiwan media articles:", sum(all_articles$Is_Taiwan == 1), "; Non-Taiwan media articles:", sum(all_articles$Is_Taiwan == 0), "."))
+
+# ------------------------------------------------------------------------------
+# Step 2: STM-Specific Text Preprocessing (Bag-of-Words Construction)
+# ------------------------------------------------------------------------------
+# 2.1 Chinese Word Segmentation and Custom Dictionary
+user_dict <- c(
+    "习近平", "李强", "李克强", "毛泽东", "邓小平", "薄熙来", "温家宝", 
+    "特朗普", "川普", "拜登", "布林肯", "蔡英文", "赖清德", "萧美琴",
+    "马英九", "柯文哲", "侯友宜", "陈水扁", "李家超", "民进党", "国民党", 
+    "共产党", "中共", "中央军委", "政治局", "立法院", "行政院", "国务院", 
+    "五角大楼", "白宫", "国台办", "乌鲁木齐", "法拉盛", "台海", "两岸关系", 
+    "印太地区", "南海", "东海", "三中全会", "白纸运动", "脱钩", "断链", 
+    "一国两制", "国安法", "反送中", "半导体", "产业链", "再生能源", 
+    "气候变迁", "社会安全网",  "解放军", "新冠疫情", "清零政策","泽连斯基","泽伦斯基","普京"
+)
+
+# Initialize Jieba tokenizer and load custom nouns
+segment_engine <- worker()
+new_user_word(segment_engine, user_dict)
+
+segment_text <- function(text) {
+  if (is.na(text) || !is.character(text)) return("")
+  segmented_words <- segment(text, segment_engine)
+  return(paste(segmented_words, collapse = " "))
+}
+
+all_articles <- all_articles %>%
+  mutate(full_text = paste(Title, Text, sep = " ")) %>%
+  mutate(segmented_text = map_chr(full_text, segment_text))
+print("Initial tokenization using segmentation engine complete.")
+
+# 2.2 Construct Stopword List and Execute Cleaning
+custom_stopwords <- c(
+  "自由亚洲电台", "报导者", "德国之声", "端传媒", "美国之音", "路透社", "编辑部", "台独分子",
+  "initium", "theinitium", "dw", "rfa", "reporter", "duan", "mangmang", "bbc", "abc", "tvbs",
+  "fill", "whatsnew", "video", "media", "podcast", "newsletter", "javascript", "browser", "web", "html", 
+  "image", "images", "getty", "gettyimages", "via", "com", "view", "run", "ta", "sam", "vincent", "cheng",
+  "订阅", "会员", "登入", "畅读", "付费", "支持", "赞助", "投稿", "版权所有", "转载", "分享", "电邮", "来源", "图片", "图",
+  "consider", "thatsupport", "upgrade", "please", "enable", "enables", "community", "communities",
+  "的", "在", "了", "是", "我", "你", "他", "她", "它", "们", "这", "那", "一", "个", "大部分", 
+  "也", "还", "就", "都", "说", "而", "及", "与", "或", "但", "因", "为", "所以", "并", 
+  "我们", "你们", "他们", "她们", "它们", "自己", "一个", "一些", "什么", "怎么", "为什么",
+  "表示", "认为", "指出", "报道", "记者", "人", "会", "去", "做", "想", "看", "写", "著",
+  "年", "月", "日", "中", "上", "下", "一个月", "所有人", "是不是", "进一步", "是因为", "不如说是", 
+  "不太好", "可信度", "万人次", "沸沸扬扬", "出去玩", "严格来说", "越来越", "一方面", "实际上", "亿美元", "第一次",
+  "jean", "weber", "ecole", "aung", "the",
+  "cindi", "fei", "好文直", "文章内容",
+  "经歪脑", "歪脑", "一个多元"
+)
+
+if (!exists("baidu_stopwords_path", inherits = FALSE)) {
+  stopword_candidates <- c(
+    file.path(base_dir, "baidu_stopwords.txt"),
+    file.path(base_dir, "data", "dictionaries", "baidu_stopwords.txt"),
+    file.path("..", "..", "data", "dictionaries", "baidu_stopwords.txt"),
+    file.path("data", "dictionaries", "baidu_stopwords.txt")
+  )
+  found_sw <- stopword_candidates[file.exists(stopword_candidates)]
+  baidu_stopwords_path <- if (length(found_sw) > 0) normalizePath(found_sw[1]) else file.path(base_dir, "baidu_stopwords.txt")
+}
+if (file.exists(baidu_stopwords_path)) {
+  baidu_stopwords <- readLines(baidu_stopwords_path, encoding = "UTF-8", warn = FALSE)
+  custom_stopwords <- unique(c(custom_stopwords, baidu_stopwords))
+  custom_stopwords <- custom_stopwords[custom_stopwords != ""]
+  custom_stopwords <- custom_stopwords[grepl("^(\\p{L}|\\p{N})+$", custom_stopwords, perl = TRUE)]
+}
+
+processed_docs <- textProcessor(
+  documents = all_articles$segmented_text,
+  metadata = all_articles,
+  lowercase = TRUE,
+  removestopwords = TRUE,
+  removenumbers = TRUE,
+  removepunctuation = TRUE,
+  stem = FALSE,
+  customstopwords = custom_stopwords
+)
+
+# 2.3 Prepare Document-Feature Matrix (DFM)
+out <- prepDocuments(
+  documents = processed_docs$documents,
+  vocab = processed_docs$vocab,
+  meta = processed_docs$meta,
+  lower.thresh = 5
+)
+docs <- out$documents
+vocab <- out$vocab
+meta <- out$meta
+
+# ------------------------------------------------------------------------------
+# Step 2.4: Pre- and Post-Cleaning Statistical Report (Export German Version)
+# ------------------------------------------------------------------------------
+print("Generating pre- and post-cleaning statistical report...")
+
+# 1. Pre-cleaning statistics (based on all_articles)
+all_articles <- all_articles %>%
+  mutate(char_count_pre = nchar(Text, type = "chars"))
+
+stats_pre_funding <- all_articles %>%
+  group_by(Funding_Sources) %>%
+  summarise(
+    Pre_Clean_Articles = n(),
+    Pre_Clean_Chars = sum(char_count_pre, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+stats_pre_media <- all_articles %>%
+  group_by(Funding_Sources, `Media Name`) %>%
+  summarise(
+    Pre_Clean_Articles = n(),
+    Pre_Clean_Chars = sum(char_count_pre, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(Funding_Sources, desc(Pre_Clean_Articles))
+
+# 2. Post-cleaning statistics (based on out$meta and out$documents)
+calc_clean_chars <- function(doc_matrix, vocab_list) {
+  if (length(doc_matrix) == 0) return(0)
+  if (is.null(dim(doc_matrix))) {
+    word_indices <- doc_matrix[1]
+    word_counts <- doc_matrix[2]
+  } else {
+    word_indices <- doc_matrix[1, ]
+    word_counts <- doc_matrix[2, ]
+  }
+  words <- vocab_list[word_indices]
+  sum(nchar(words, type = "chars") * word_counts, na.rm = TRUE)
+}
+
+clean_chars_list <- sapply(out$documents, calc_clean_chars, vocab_list = out$vocab)
+
+meta_clean <- out$meta %>%
+  mutate(char_count_post = clean_chars_list)
+
+stats_post_funding <- meta_clean %>%
+  group_by(Funding_Sources) %>%
+  summarise(
+    Post_Clean_Articles = n(),
+    Post_Clean_Chars = sum(char_count_post, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+stats_post_media <- meta_clean %>%
+  group_by(Funding_Sources, `Media Name`) %>%
+  summarise(
+    Post_Clean_Articles = n(),
+    Post_Clean_Chars = sum(char_count_post, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(Funding_Sources, desc(Post_Clean_Articles))
+
+# 3. Merge comparison results and construct unified report
+summary_media <- stats_pre_media %>%
+  left_join(stats_post_media, by = c("Funding_Sources", "Media Name")) %>%
+  mutate(
+    Post_Clean_Articles = replace_na(Post_Clean_Articles, 0),
+    Post_Clean_Chars = replace_na(Post_Clean_Chars, 0)
+  )
+
+summary_media_formatted <- summary_media %>%
+  mutate(
+    Category = as.character(Funding_Sources),
+    `Diff Characters` = Pre_Clean_Chars - Post_Clean_Chars
+  ) %>%
+  select(
+    Category,
+    Media = `Media Name`,
+    `Pre-Clean Articles` = Pre_Clean_Articles,
+    `Pre-Clean Characters` = Pre_Clean_Chars,
+    `Post-Clean Articles` = Post_Clean_Articles,
+    `Post-Clean Characters` = Post_Clean_Chars,
+    `Diff Characters`
+  ) %>%
+  arrange(Category, desc(`Pre-Clean Articles`))
+
+foreign_media <- summary_media_formatted %>% filter(Category == "Foreign Gov-Affiliated")
+other_media <- summary_media_formatted %>% filter(Category == "Other Sources")
+
+foreign_total <- foreign_media %>%
+  summarise(
+    Category = "Foreign Gov-Affiliated",
+    Media = "Foreign Gov-Affiliated (Total)",
+    `Pre-Clean Articles` = sum(`Pre-Clean Articles`),
+    `Pre-Clean Characters` = sum(`Pre-Clean Characters`),
+    `Post-Clean Articles` = sum(`Post-Clean Articles`),
+    `Post-Clean Characters` = sum(`Post-Clean Characters`),
+    `Diff Characters` = sum(`Diff Characters`)
+  )
+
+other_total <- other_media %>%
+  summarise(
+    Category = "Other Sources",
+    Media = "Other Sources (Total)",
+    `Pre-Clean Articles` = sum(`Pre-Clean Articles`),
+    `Pre-Clean Characters` = sum(`Pre-Clean Characters`),
+    `Post-Clean Articles` = sum(`Post-Clean Articles`),
+    `Post-Clean Characters` = sum(`Post-Clean Characters`),
+    `Diff Characters` = sum(`Diff Characters`)
+  )
+
+overall_total <- summary_media_formatted %>%
+  summarise(
+    Category = "All",
+    Media = "Total",
+    `Pre-Clean Articles` = sum(`Pre-Clean Articles`),
+    `Pre-Clean Characters` = sum(`Pre-Clean Characters`),
+    `Post-Clean Articles` = sum(`Post-Clean Articles`),
+    `Post-Clean Characters` = sum(`Post-Clean Characters`),
+    `Diff Characters` = sum(`Diff Characters`)
+  )
+
+final_report <- bind_rows(
+  foreign_media,
+  foreign_total,
+  other_media,
+  other_total,
+  overall_total
+) %>% select(-Category)
+
+final_report_de <- final_report %>%
+  mutate(Media = recode(Media,
+    "Foreign Gov-Affiliated (Total)" = "Staatlich bzw. öffentlich finanzierte Medien (gesamt)",
+    "Other Sources (Total)" = "Medien mit anderen Finanzierungsquellen (gesamt)",
+    "Total" = "Gesamt")) %>%
+  rename(
+    Medium = Media,
+    `Artikel vor Bereinigung` = `Pre-Clean Articles`,
+    `Zeichen vor Bereinigung` = `Pre-Clean Characters`,
+    `Artikel nach Bereinigung` = `Post-Clean Articles`,
+    `Zeichen nach Bereinigung` = `Post-Clean Characters`,
+    `Entfernte Zeichen` = `Diff Characters`
+  )
+
+write_xlsx(final_report_de, file.path(results_dir, "data_cleaning_stats_loc.xlsx"))
+print("Data cleaning statistical report exported to data_cleaning_stats_loc.xlsx.")
+
+# ------------------------------------------------------------------------------
+# Step 3: Diagnostic Selection of Optimal Number of Topics (K) [German 4-Panel Plot]
+# ------------------------------------------------------------------------------
+# Note: SearchK computation is time-consuming. If local checkpoint exists, load directly;
+# To recompute, set recompute_search_k to TRUE.
+recompute_search_k <- FALSE
+checkpoint_k_file <- file.path(results_dir, "search_k_result_loc.RData")
+
+if (file.exists(checkpoint_k_file) && !recompute_search_k) {
+  print("Existing SearchK checkpoint detected (search_k_result_loc.RData), loading directly...")
+  load(checkpoint_k_file)
+} else {
+  print("Executing SearchK diagnostic computation (testing K = 5, 10, 15, 20, 25, 30)...")
+  search_k_result <- searchK(
+    documents = out$documents,
+    vocab = out$vocab,
+    K = c(5, 10, 15, 20, 25, 30),
+    prevalence = ~ Funding_Sources + Is_Taiwan,
+    data = out$meta,
+    init.type = "Spectral",
+    verbose = TRUE
+  )
+  save(search_k_result, file = checkpoint_k_file)
+  print("SearchK diagnostic results saved to search_k_result_loc.RData.")
+}
+
+# Generate 4-panel German diagnostic plot (top-tier journal typesetting, left-aligned unboxed title, uniform color palette, K=20 anchor highlighted)
+plot_search_k_de <- function(x, opt_k = 20) {
+  k_df <- data.frame(
+    K = as.numeric(unlist(x$results$K)),
+    heldout = as.numeric(unlist(x$results$heldout)),
+    residual = as.numeric(unlist(x$results$residual)),
+    semcoh = as.numeric(unlist(x$results$semcoh)),
+    lbound = as.numeric(unlist(x$results$lbound))
+  )
+  
+  k_long <- k_df %>%
+    pivot_longer(cols = c(heldout, residual, semcoh, lbound), names_to = "metric", values_to = "value") %>%
+    mutate(
+      metric_label = factor(
+        metric,
+        levels = c("heldout", "residual", "semcoh", "lbound"),
+        labels = c(
+          "A   Held-out-Likelihood",
+          "B   Residualdispersion",
+          "C   Semantische Kohärenz",
+          "D   Variationsuntergrenze (ELBO)"
+        )
+      )
+    )
+  
+  col_primary <- "#1B7A60"  # Uniform deep pine green
+  col_muted   <- "#9CA3AF"  # Reference dashed line gray
+  
+  p <- ggplot(k_long, aes(x = K, y = value)) +
+    geom_vline(xintercept = opt_k, linetype = "dashed", color = col_muted, linewidth = 0.5) +
+    geom_line(color = col_primary, linewidth = 1.05) +
+    geom_point(shape = 21, size = 3.2, fill = "white", color = col_primary, stroke = 1.4) +
+    geom_point(data = filter(k_long, K == opt_k),
+               shape = 21, size = 4.6, fill = col_primary, color = "white", stroke = 1.6) +
+    facet_wrap(~ metric_label, scales = "free_y", ncol = 2) +
+    scale_x_continuous(breaks = seq(5, 30, by = 5)) +
+    scale_y_continuous(labels = scales::label_number(scale_cut = scales::cut_short_scale())) +
+    labs(
+      title = "Diagnosekennzahlen zur Wahl der Themenanzahl (K)",
+      subtitle = "Optimaler Modellkompromiss gewählt bei K = 20 (Trade-off zwischen Kohärenz und Modellpassung)",
+      x = "Anzahl der Themen (K)",
+      y = NULL
+    ) +
+    theme_bw(base_size = 13) +
+    theme(
+      text = element_text(family = "sans"),
+      plot.background = element_rect(fill = "white", color = NA),
+      panel.background = element_rect(fill = "white", color = NA),
+      plot.title = element_text(face = "bold", size = 16, color = "#111827", hjust = 0, margin = margin(b = 4)),
+      plot.subtitle = element_text(size = 11.5, color = "#4B5563", hjust = 0, margin = margin(b = 16)),
+      strip.background = element_blank(),
+      strip.text = element_text(face = "bold", size = 12, color = "#1F2937", hjust = 0, margin = margin(t = 2, b = 8)),
+      panel.border = element_rect(color = "#D1D5DB", fill = NA, linewidth = 0.6),
+      panel.grid.major.y = element_line(color = "#F3F4F6", linewidth = 0.5),
+      panel.grid.major.x = element_blank(),
+      panel.grid.minor = element_blank(),
+      axis.title.x = element_text(face = "bold", size = 12.5, color = "#1F2937", margin = margin(t = 12)),
+      axis.text = element_text(size = 10.5, color = "#374151"),
+      axis.ticks = element_line(color = "#9CA3AF", linewidth = 0.5),
+      axis.ticks.length = unit(3, "pt"),
+      panel.spacing.x = unit(1.8, "lines"),
+      panel.spacing.y = unit(1.8, "lines"),
+      plot.margin = margin(t = 16, r = 24, b = 16, l = 20)
+    )
+  return(p)
+}
+
+p_search_k <- plot_search_k_de(search_k_result, opt_k = K_selected)
+ggsave(file.path(results_dir, "search_k_result_loc.png"), plot = p_search_k, width = 10, height = 7.2, dpi = 300, bg = "white")
+print("German 4-panel topic diagnostic plot saved as search_k_result_loc.png.")
+
+# ------------------------------------------------------------------------------
+# Step 4: Fit Final STM Model (with Is_Taiwan Covariate)
+# ------------------------------------------------------------------------------
+K_selected <- 20 # 20 topics selected according to research specifications
+
+stm_model <- stm(
+  documents = out$documents,
+  vocab = out$vocab,
+  K = K_selected, 
+  prevalence = ~ Funding_Sources + Is_Taiwan,
+  max.em.its = 200, 
+  data = out$meta,
+  init.type = "Spectral",
+  seed = 42
+)
+
+if (stm_model$convergence$converged) {
+  print("Model fitting complete and successfully converged.")
+} else {
+  warning("Model failed to converge. Please increase max.em.its and re-fit.")
+}
+
+# ------------------------------------------------------------------------------
+# Step 5: Model Inference and Effect Estimation (German Plots and Reports)
+# ------------------------------------------------------------------------------
+# 5.1 Inspect Topic Keywords and Export Top 20 Terms
+print("Representative keywords for each topic:")
+print_model_de(labelTopics(stm_model, n = 10))
+
+print("Extracting and exporting top 20 keywords for each topic...")
+topic_labels_20 <- labelTopics(stm_model, n = 20)
+top_20_df_de <- tibble(
+  `Thema` = paste0("Thema ", 1:K_selected),
+  `Höchste Wortwahrscheinlichkeit` = apply(topic_labels_20$prob, 1, paste, collapse = ", "),
+  `FREX (Häufigkeit und Exklusivität)` = apply(topic_labels_20$frex, 1, paste, collapse = ", "),
+  `Relative Überrepräsentation` = apply(topic_labels_20$lift, 1, paste, collapse = ", "),
+  `Bewertungswert` = apply(topic_labels_20$score, 1, paste, collapse = ", ")
+)
+write_xlsx(top_20_df_de, file.path(results_dir, "topic_top20_keywords_loc.xlsx"))
+print("Top 20 keywords for each topic exported to topic_top20_keywords_loc.xlsx.")
+
+# 5.2 Estimate Metadata Effects on Topic Prevalence (Controlling for Is_Taiwan)
+effect <- estimateEffect(
+  formula = 1:K_selected ~ Funding_Sources + Is_Taiwan,
+  stmobj = stm_model,
+  meta = out$meta,
+  uncertainty = "Global"
+)
+summary_effect <- summary(effect)
+
+# 5.3 Export Effects Summary Table (German Labels)
+tables_list <- summary_effect$tables
+final_results <- map_dfr(tables_list, ~ as.data.frame(.) %>% tibble::rownames_to_column("Covariate"), .id = "Topic") %>%
+  filter(!str_detect(Covariate, "Intercept")) %>%
+  mutate(
+    Topic = as.integer(str_remove(Topic, "Topic ")),
+    Covariate_DE = covariate_labels_de(Covariate),
+    p.value_formatted = scales::pvalue(`Pr(>|t|)`, accuracy = 0.001)
+  ) %>%
+  select(
+    `Topic_Num` = Topic,
+    `Covariate` = Covariate_DE,
+    `Estimate_Gamma` = Estimate,
+    `Std_Error` = `Std. Error`,
+    `p_value` = p.value_formatted
+  ) %>%
+  arrange(`Topic_Num`)
+
+write_xlsx(final_results, file.path(results_dir, "stm_effects_summary_loc.xlsx"))
+print("Effects summary table exported to stm_effects_summary_loc.xlsx.")
+
+# 5.4 Extract Topic Prevalence Effect Plot Data (Funding Sources after Controlling for Taiwan Covariate)
+plot_data <- purrr::map_dfr(summary_effect$tables, function(topic_table) {
+  # Dynamically match Funding_Sources coefficient row
+  target_row <- topic_table[grepl("Funding_Sources", rownames(topic_table)), , drop = FALSE]
+  if (nrow(target_row) > 0) {
+    row_name <- rownames(target_row)[1]
+    raw_est <- target_row[, "Estimate"]
+    se <- target_row[, "Std. Error"]
+    
+    # Automatic baseline alignment: ensures positive values indicate higher prevalence in foreign state-affiliated media
+    est <- ifelse(grepl("Other Sources", row_name), -raw_est, raw_est)
+    
+    tibble(
+      estimate = est,
+      conf.low = est - 1.96 * se,
+      conf.high = est + 1.96 * se,
+      p.value = target_row[, "Pr(>|t|)"]
+    )
+  } else {
+    tibble(estimate = NA, conf.low = NA, conf.high = NA, p.value = NA)
+  }
+}, .id = "topic") %>%
+  mutate(
+    significant = p.value < 0.05,
+    topic_num = as.integer(stringr::str_remove(topic, "Topic |[[:space:]]"))
+  ) %>%
+  arrange(desc(topic_num)) %>%
+  mutate(topic_label = factor(topic, levels = unique(topic)))
+
+# Draw German effect distribution plot with topic numbers (my_final_plot_loc.png)
+plot_data_short <- plot_data %>%
+  mutate(
+    label_text = paste("Thema", topic_num),
+    label_side = ifelse(estimate >= 0, "right", "left"),
+    label_x = ifelse(label_side == "right", conf.high + 0.005, conf.low - 0.005),
+    label_hjust = ifelse(label_side == "right", 0, 1)
+  )
+
+p_to_tweak <- ggplot(plot_data_short, aes(x = estimate, y = topic_label)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey45", linewidth = 0.8) +
+  geom_errorbarh(aes(xmin = conf.low, xmax = conf.high), height = 0, color = "#374151", linewidth = 1.1) +
+  geom_point(aes(color = significant), size = 4.5) +
+  geom_text(
+    aes(label = label_text, x = label_x, hjust = label_hjust),
+    size = 4,
+    color = "#1F2937",
+    fontface = "bold",
+    family = "sans"
+  ) +
+  labs(
+    title = "Einfluss der Finanzierungsquelle auf die Themenprävalenz",
+    x = "Geschätzter Prävalenzunterschied\n(Positiv = Höherer Anteil bei staatlich bzw. öffentlich finanzierten Medien)",
+    y = NULL,
+    color = "Statistische Signifikanz (p < 0,05)"
+  ) +
+  scale_color_manual(
+    values = c("TRUE" = "#1B7A60", "FALSE" = "#6B7280"),
+    labels = c("TRUE" = "Signifikant", "FALSE" = "Nicht signifikant")
+  ) +
+  scale_x_continuous(
+    breaks = seq(-0.15, 0.15, by = 0.05),
+    labels = scales::number_format(accuracy = 0.01),
+    limits = c(-0.16, 0.16)
+  ) +
+  theme_bw(base_size = 14) +
+  theme(
+    text = element_text(family = "sans"),
+    plot.title = element_text(size = 16, hjust = 0.5, face = "bold", margin = margin(b = 14)),
+    legend.position = "bottom",
+    legend.margin = margin(t = 10),
+    legend.spacing.x = unit(0.4, "cm"),
+    legend.title = element_text(size = 12, face = "bold"),
+    legend.text = element_text(size = 11.5),
+    axis.title.x = element_text(size = 12, face = "bold", lineheight = 1.25, margin = margin(t = 10)),
+    axis.text.x = element_text(size = 11, face = "bold", color = "black"),
+    axis.title.y = element_blank(),
+    axis.text.y = element_blank(),
+    axis.ticks.y = element_blank(),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor.y = element_blank(),
+    panel.grid.major.x = element_line(color = "grey90", linetype = "dashed"),
+    panel.border = element_rect(color = "black", linewidth = 0.8),
+    plot.margin = margin(t = 15, r = 25, b = 15, l = 20)
+  )
+
+ggsave(file.path(results_dir, "my_final_plot_loc.png"), plot = p_to_tweak, width = 12, height = 8.5, dpi = 300, bg = "white")
+print("Topic prevalence effect distribution plot saved as my_final_plot_loc.png.")
+
+german_summary_path <- file.path(results_dir, paste0("topic_summaries_loc_", current_seed, ".xlsx"))
+if (!file.exists(german_summary_path)) {
+  german_summary_path <- file.path(results_dir, "topic_summaries_loc_42.xlsx")
+}
+if (file.exists(german_summary_path)) {
+  german_labels_df <- readxl::read_excel(german_summary_path)
+  
+  if (setequal(german_labels_df$Topic, seq_len(K_selected))) {
+    plot_data_german <- plot_data %>%
+      left_join(german_labels_df, by = c("topic_num" = "Topic")) %>%
+      mutate(
+        label_text = paste0("Thema ", topic_num, ": ", Title_DE),
+        label_side = ifelse(estimate >= 0, "right", "left"),
+        label_x = ifelse(label_side == "right", conf.high + 0.005, conf.low - 0.005),
+        label_hjust = ifelse(label_side == "right", 0, 1)
+      )
+    
+    p_german <- ggplot(plot_data_german, aes(x = estimate, y = topic_label)) +
+      geom_vline(xintercept = 0, linetype = "dashed", color = "grey45", linewidth = 0.8) +
+      geom_errorbarh(aes(xmin = conf.low, xmax = conf.high), height = 0, color = "#374151", linewidth = 1.1) +
+      geom_point(aes(color = significant), size = 4.5) +
+      geom_text(
+        aes(label = label_text, x = label_x, hjust = label_hjust),
+        size = 3.6,
+        color = "#1F2937",
+        fontface = "plain",
+        family = "sans"
+      ) +
+      labs(
+        title = "Einfluss der Finanzierungsquelle auf die Themenprävalenz",
+        x = "Geschätzter Prävalenzunterschied\n(Positiv = Höherer Anteil bei staatlich bzw. öffentlich finanzierten Medien)", 
+        y = NULL,
+        color = "Statistische Signifikanz (p < 0,05)"
+      ) +
+      scale_color_manual(
+        values = c("TRUE" = "#1B7A60", "FALSE" = "#6B7280"), 
+        labels = c("TRUE" = "Signifikant", "FALSE" = "Nicht signifikant")
+      ) +
+      scale_x_continuous(
+        breaks = seq(-0.20, 0.20, by = 0.05),
+        labels = scales::number_format(accuracy = 0.01),
+        limits = c(-0.25, 0.25)
+      ) +
+      theme_bw(base_size = 14) +
+      theme(
+        text = element_text(family = "sans"),
+        plot.title = element_text(size = 16, hjust = 0.5, face = "bold", margin = margin(b = 14)),
+        legend.position = "bottom",
+        legend.margin = margin(t = 10),
+        legend.spacing.x = unit(0.4, "cm"),
+        legend.title = element_text(size = 12, face = "bold"),
+        legend.text = element_text(size = 11.5),
+        axis.title.x = element_text(size = 12, face = "bold", lineheight = 1.25, margin = margin(t = 10)),
+        axis.text.x = element_text(size = 11, face = "bold", color = "black"),
+        axis.title.y = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        panel.grid.major.y = element_blank(),
+        panel.grid.minor.y = element_blank(),
+        panel.grid.major.x = element_line(color = "grey90", linetype = "dashed"),
+        panel.border = element_rect(color = "black", linewidth = 0.8),
+        plot.margin = margin(t = 15, r = 25, b = 15, l = 20)
+      )
+    
+    ggsave(file.path(results_dir, "my_final_plot_loc_german.png"), plot = p_german, width = 13.5, height = 8.5, dpi = 300, bg = "white")
+    print("Effect distribution plot with German topic labels saved as my_final_plot_loc_german.png.")
+  }
+} else {
+  warning(paste0("German topic titles file not found (", basename(german_summary_path), "), skipping German-labeled effect plot generation."))
+}
+
+# 5.5 Extract FREX Keywords and Generate Bilingual Topic Prevalence Plot
+print("Starting FREX keyword extraction and topic prevalence plot generation...")
+
+topic_labels <- labelTopics(stm_model, n = 10)
+frex_matrix <- topic_labels$frex
+topic_prevalence <- colMeans(stm_model$theta)
+
+frex_df <- as.data.frame(frex_matrix)
+colnames(frex_df) <- paste("Keyword", 1:ncol(frex_matrix))
+frex_df$Topic_Num <- paste0("Topic ", 1:K_selected)
+
+prevalence_df <- tibble(
+  Topic_Num = paste0("Topic ", 1:K_selected),
+  Prevalence = topic_prevalence
+)
+
+sorted_frex_df <- left_join(prevalence_df, frex_df, by = "Topic_Num") %>%
+  arrange(desc(Prevalence))
+
+sorted_frex_df_de <- sorted_frex_df %>%
+  mutate(Topic_Num = str_replace(Topic_Num, "^Topic ", "Thema ")) %>%
+  rename(Thema = Topic_Num, Themenprävalenz = Prevalence) %>%
+  rename_with(~ str_replace(.x, "^Keyword ", "Schlüsselwort "), starts_with("Keyword"))
+write_xlsx(sorted_frex_df_de, file.path(results_dir, "topic_frex_keywords_sorted_loc.xlsx"))
+print("Prevalence-sorted FREX vocabulary saved to topic_frex_keywords_sorted_loc.xlsx.")
+
+keywords_cn <- apply(frex_matrix, 1, function(row) {
+  paste(row, collapse = ", ")
+})
+
+de_frex_path <- file.path(results_dir, "topic_frex_keywords_german.xlsx")
+if (file.exists(de_frex_path)) {
+  de_frex_df <- readxl::read_excel(de_frex_path) %>%
+    mutate(across(starts_with("Keyword"), ~ recode(.x,
+      "Year" = "Jahr",
+      "Livestream-Raum" = "Raum für Direktübertragungen"))) %>%
+    mutate(topic_idx = as.integer(stringr::str_extract(Topic_Num, "\\d+"))) %>% 
+    arrange(topic_idx)
+  
+  keywords_de <- apply(de_frex_df %>% select(starts_with("Keyword")), 1, paste, collapse = ", ")
+  prevalence_data <- tibble(
+    topic = paste("Thema", 1:K_selected),
+    prevalence = topic_prevalence,
+    keywords_cn = keywords_cn,
+    keywords_de = keywords_de
+  ) %>%
+    mutate(keywords_combined = paste0(keywords_cn, "\n(", keywords_de, ")"))
+} else {
+  prevalence_data <- tibble(
+    topic = paste("Thema", 1:K_selected),
+    prevalence = topic_prevalence,
+    keywords_cn = keywords_cn,
+    keywords_combined = keywords_cn
+  )
+}
+
+prevalence_plot <- ggplot(prevalence_data, aes(x = prevalence, y = reorder(topic, prevalence))) +
+  geom_col(fill = "#8BA09E", width = 0.8) +
+  geom_text(
+    aes(label = keywords_de), 
+    hjust = 0, 
+    nudge_x = 0.002, 
+    nudge_y = 0.18, 
+    size = 14,
+    family = "song"
+  ) +
+  geom_text(
+    aes(label = paste0("(", keywords_cn, ")")), 
+    hjust = 0, 
+    nudge_x = 0.002, 
+    nudge_y = -0.18, 
+    size = 11,
+    family = "song",
+    color = "gray40"
+  ) +
+  scale_x_continuous(
+    labels = scales::percent_format(accuracy = 1),
+    expand = expansion(mult = c(0.01, 1.8))
+  ) +
+  labs(
+    title = "Themenprävalenz im Gesamtkorpus",
+    subtitle = "Charakteristische FREX-Wörter pro Thema",
+    x = "Mittlere Themenprävalenz",
+    y = "Thema"
+  ) +
+  theme_bw(base_size = 32) + 
+  theme(
+     plot.title = element_text(size = 42, face = "bold"), 
+     plot.subtitle = element_text(size = 32, color = "gray40"),
+     panel.grid.major.y = element_blank(),
+     panel.grid.minor.x = element_blank()
+  )
+
+ggsave(file.path(results_dir, "overall_topic_prevalence_frex_loc.png"), prevalence_plot, width = 20, height = 12, dpi = 300)
+print("Bilingual topic prevalence plot saved as overall_topic_prevalence_frex_loc.png.")
+
+# ------------------------------------------------------------------------------
+# Step 6: Sample Extraction for LLM Prompt Tuning and Gold Standard Validation Set
+# ------------------------------------------------------------------------------
+print("Constructing LLM sample pool and extracting posterior topic matrix...")
+
+# Helper function: Export portable HTML reader
+export_to_html_reader <- function(df, file_path, title_text) {
+  html_content <- c(
+    "<html><head><meta charset='utf-8'><style>",
+    "body { font-family: 'Helvetica Neue', Arial, 'Microsoft YaHei', sans-serif; line-height: 1.6; max-width: 800px; margin: auto; padding: 20px; color: #333; }",
+    "h1 { text-align: center; color: #2c3e50; }",
+    ".article { border-bottom: 2px solid #eee; padding-bottom: 20px; margin-bottom: 30px; }",
+    ".meta { color: #7f8c8d; font-size: 0.9em; margin-bottom: 15px; }",
+    ".content { font-size: 1.1em; text-align: justify; }",
+    "</style></head><body>",
+    paste0("<h1>", title_text, "</h1>")
+  )
+  
+  for(i in 1:nrow(df)) {
+    article_html <- paste0(
+      "<div class='article'>",
+      "<h2>[", i, "] ", df$Title[i], "</h2>",
+      "<div class='meta'>",
+      "<b>Dokument-ID:</b> ", df$Doc_ID[i],
+      "</div>",
+      "<div class='content'>", gsub("\n", "<br>", df$Text[i]), "</div>",
+      "</div>"
+    )
+    html_content <- c(html_content, article_html)
+  }
+  html_content <- c(html_content, "</body></html>")
+  writeLines(html_content, file_path, useBytes = TRUE)
+}
+
+rr_meta <- meta
+rr_meta$Doc_ID <- 1:nrow(rr_meta)
+rr_theta <- stm_model$theta
+
+theta_df <- as.data.frame(stm_model$theta)
+colnames(theta_df) <- paste0("Topic_", 1:ncol(theta_df))
+
+meta_for_llm_full <- bind_cols(meta, theta_df) %>%
+  mutate(Doc_ID = row_number())
+
+if (current_seed == "42") {
+  # 6.1 Extract 30 development samples for prompt tuning (20 typical cases + 10 high-entropy cases)
+  tuning_sample_path <- file.path(results_dir, "rich_range_sample_for_LLM_tuning_loc.xlsx")
+  if (file.exists(tuning_sample_path)) {
+    print("Existing prompt-tuning sample detected, loading directly to maintain alignment...")
+    rich_range_sample_30 <- read_excel(tuning_sample_path)
+  } else {
+    typical_cases_idx <- apply(rr_theta, 2, which.max)
+    typical_cases <- rr_meta[typical_cases_idx, ]
+    typical_cases$Sample_Type <- paste0("Typischer Fall (Thema ", 1:K_selected, ")")
+
+    rr_meta$Entropy <- apply(rr_theta, 1, function(p) {
+      -sum(p * log(p + 1e-9))
+    })
+
+    ambiguous_cases <- rr_meta %>%
+      filter(!Doc_ID %in% typical_cases$Doc_ID) %>% 
+      arrange(desc(Entropy)) %>%                    
+      slice_head(n = 10) %>%                        
+      mutate(Sample_Type = "Mehrdeutiger Fall (hohe Entropie)")
+
+    rich_range_sample_30 <- bind_rows(typical_cases, ambiguous_cases)
+    export_rr_data <- rich_range_sample_30 %>% select(Doc_ID, Title, Text)
+    write_xlsx(export_rr_data, tuning_sample_path)
+    export_to_html_reader(export_rr_data, file.path(results_dir, "rich_range_sample_for_LLM_tuning_loc.html"), "LLM Prompt Tuning Development Sample (Entwicklungsstichprobe mit breitem Fallspektrum)")
+  }
+
+  # Export blank coding template for human prompt tuning (if not exists)
+  human_tuning_path <- file.path(results_dir, "human_coded_tuning_loc.xlsx")
+  if (!file.exists(human_tuning_path)) {
+    export_rr_human <- rich_range_sample_30 %>% select(Doc_ID, Title, Text) %>% mutate(Human_Score = NA)
+    write_xlsx(export_rr_human, human_tuning_path)
+  }
+
+  # 6.2 Extract 100-article Gold Standard Random Validation Sample
+  val_sample_path <- file.path(results_dir, "random_validation_sample_loc.xlsx")
+  if (file.exists(val_sample_path)) {
+    print("Existing validation sample detected, loading directly to maintain alignment...")
+    random_validation_sample <- read_excel(val_sample_path)
+  } else {
+    set.seed(123)
+    random_validation_sample <- rr_meta %>%
+      filter(!Doc_ID %in% rich_range_sample_30$Doc_ID) %>%
+      slice_sample(n = 100) %>%
+      mutate(Sample_Type = "Zufallsstichprobe zur Validierung (manueller Referenzstandard)")
+
+    export_val_data <- random_validation_sample %>% select(Doc_ID, Title, Text)
+    write_xlsx(export_val_data, val_sample_path)
+    export_to_html_reader(export_val_data, file.path(results_dir, "random_validation_sample_loc.html"), "Human Coded Random Validation Sample (Referenzstandard)")
+  }
+
+  # Export blank coding template for human validation (if not exists)
+  human_val_path <- file.path(results_dir, "human_coded_validation_loc.xlsx")
+  if (!file.exists(human_val_path)) {
+    export_val_human <- random_validation_sample %>% select(Doc_ID, Title, Text) %>% mutate(Human_Score = NA)
+    write_xlsx(export_val_human, human_val_path)
+  }
+
+  # 6.3 Export Remaining Unlabeled Sample for Automated LLM Batch Scoring
+  output_path_remaining <- file.path(results_dir, "remaining_sample_for_LLM_scoring_loc.xlsx")
+  remaining_sample <- meta_for_llm_full %>%
+    filter(!Doc_ID %in% rich_range_sample_30$Doc_ID) %>%
+    filter(!Doc_ID %in% random_validation_sample$Doc_ID) %>%
+    select(Doc_ID, Title, Text)
+
+  if (!file.exists(output_path_remaining)) {
+    write_xlsx(remaining_sample, output_path_remaining)
+    print(paste("Remaining automated scoring sample exported to:", output_path_remaining))
+  }
+
+  # 6.4 (Optional) Prompt Tuning Error Analysis
+  tuning_human_file <- file.path(results_dir, "human_coded_tuning_loc.xlsx")
+  tuning_llm_file <- file.path(results_dir, "llm_scored_tuning_loc.xlsx")
+  if (file.exists(tuning_human_file) && file.exists(tuning_llm_file)) {
+    df_human_tune <- read_excel(tuning_human_file) %>% select(Doc_ID, Human_Score)
+    df_llm_tune <- read_excel(tuning_llm_file) %>% select(Doc_ID, LLM_Score, LLM_Reasoning, Text)
+    
+    error_analysis_df <- inner_join(df_human_tune, df_llm_tune, by = "Doc_ID") %>%
+      filter(!is.na(Human_Score) & !is.na(LLM_Score)) %>%
+      filter(Human_Score != LLM_Score)
+    
+    if(nrow(error_analysis_df) > 0) {
+      error_output_path <- file.path(results_dir, "prompt_tuning_error_analysis.xlsx")
+      write_xlsx(error_analysis_df, error_output_path)
+      print(paste("Prompt tuning error cases exported to:", error_output_path))
+    }
+  }
+
+  # ------------------------------------------------------------------------------
+  # Step 7: Inter-Coder Reliability (Validation) and Classification Metrics
+  # ------------------------------------------------------------------------------
+  print("=== Phase A: Reliability and Classification Performance Validation ===")
+  val_human_path <- file.path(results_dir, "human_coded_validation_loc.xlsx")
+  val_llm_path <- file.path(results_dir, "llm_scored_validation_loc.xlsx")
+
+  if (file.exists(val_human_path) && file.exists(val_llm_path)) {
+    human_val <- read_excel(val_human_path) %>% select(Doc_ID, Human_Score)
+    llm_val <- read_excel(val_llm_path) %>% select(Doc_ID, LLM_Score)
+    
+    val_script <- file.path(local_dir, "validation_metrics.R")
+    if (file.exists(val_script)) {
+      source(val_script)
+    } else {
+      calculate_validation_metrics <- function(human_val, llm_val) {
+        val_check <- inner_join(human_val, llm_val, by = "Doc_ID") %>%
+          mutate(Human_Score = as.numeric(Human_Score), LLM_Score = as.numeric(LLM_Score)) %>%
+          filter(!is.na(Human_Score), !is.na(LLM_Score))
+        nominal_alpha <- function(h, l) irr::kripp.alpha(rbind(h, l), method = "nominal")$value
+        applicable_h <- val_check$Human_Score != -99
+        applicable_l <- val_check$LLM_Score != -99
+        stance_check <- val_check[applicable_h & applicable_l, ]
+        summary <- data.frame(
+          Task = c("Joint labels (nominal)", "Target applicability (nominal)", "Stance, both applicable (nominal)"),
+          N = c(nrow(val_check), nrow(val_check), nrow(stance_check)),
+          Alpha = c(nominal_alpha(val_check$Human_Score, val_check$LLM_Score),
+                    nominal_alpha(as.integer(applicable_h), as.integer(applicable_l)),
+                    nominal_alpha(stance_check$Human_Score, stance_check$LLM_Score)),
+          Accuracy = c(mean(val_check$Human_Score == val_check$LLM_Score),
+                       mean(applicable_h == applicable_l),
+                       if (nrow(stance_check) > 0) mean(stance_check$Human_Score == stance_check$LLM_Score) else NA_real_)
+        )
+        classes <- c(-99, -1, 0, 1)
+        metrics <- do.call(rbind, lapply(classes, function(cl) {
+          tp <- sum(val_check$Human_Score == cl & val_check$LLM_Score == cl)
+          support <- sum(val_check$Human_Score == cl)
+          pred <- sum(val_check$LLM_Score == cl)
+          data.frame(
+            Class = cl, Support = support, Predicted = pred,
+            Precision = if (pred > 0) tp / pred else NA_real_,
+            Recall = if (support > 0) tp / support else NA_real_,
+            F1 = if (support + pred > 0) 2 * tp / (support + pred) else NA_real_
+          )
+        }))
+        confusion <- table(Human = factor(val_check$Human_Score, levels = classes),
+                           LLM = factor(val_check$LLM_Score, levels = classes))
+        list(val_check = val_check, summary = summary, metrics = metrics, confusion = confusion)
+      }
+    }
+    
+    validation <- calculate_validation_metrics(human_val, llm_val)
+    val_check <- validation$val_check
+    
+    if (nrow(val_check) > 0) {
+      alpha_val <- round(validation$summary$Alpha[1], 4)
+      print("Inter-coder agreement and accuracy (Krippendorff's Alpha on nominal scale):")
+      validation_summary_de <- validation$summary %>%
+        mutate(Task = recode(Task,
+          "Joint labels (nominal)" = "Vierstufige Codierung (nominal)",
+          "Target applicability (nominal)" = "Anwendbarkeit der zielbezogenen Codierung (nominal)",
+          "Stance, both applicable (nominal)" = "Stance-Klassifikation bei beidseitiger Anwendbarkeit (nominal)")) %>%
+        rename(Aufgabe = Task, Stichprobenumfang = N,
+               `Krippendorffs Alpha` = Alpha, Klassifikationsgenauigkeit = Accuracy)
+      print(validation_summary_de, digits = 4, row.names = FALSE)
+      
+      print("=== Phase A Supplementary Validation: Machine Learning Classification Performance (F1-Score) ===")
+      metrics <- validation$metrics
+      print("Model precision, recall, and F1-score on the validation set:")
+      metrics_de <- metrics %>%
+        rename(Klasse = Class, `Fallzahl (n)` = Support,
+               `Vorhergesagte Häufigkeit` = Predicted,
+               Präzision = Precision, Recall = Recall, `F1-Maß` = F1)
+      print(metrics_de, digits = 4, row.names = FALSE)
+      
+      cm_data <- as.data.frame(validation$confusion)
+      p_cm <- ggplot(data = cm_data, mapping = aes(x = LLM, y = Human)) +
+        geom_tile(aes(fill = Freq), color = "white", linewidth = 1.2) +
+        geom_text(
+          aes(
+            label = sprintf("%d", Freq),
+            color = Freq > max(Freq) * 0.45
+          ),
+          size = 8.5,
+          fontface = "bold",
+          vjust = 0.5
+        ) +
+        scale_color_manual(values = c("TRUE" = "white", "FALSE" = "#1F2937"), guide = "none") +
+        scale_fill_gradient(
+          low = "#F4FAF7",
+          high = "#1B7A60",
+          name = "Häufigkeit",
+          breaks = scales::pretty_breaks(n = 5)
+        ) +
+        scale_y_discrete(limits = rev) +
+        labs(
+          title = "Konfusionsmatrix: Manuelle vs. LLM-basierte Codierung",
+          subtitle = "Vergleich der manuellen Referenzcodierung mit den LLM-Klassifikationen (N = 100)",
+          x = "LLM-Klassifikation",
+          y = "Manuelle Referenzcodierung",
+          caption = "Kategorien: −99 = Nicht anwendbar | −1 = Ablehnend | 0 = Neutral | +1 = Befürwortend"
+        ) +
+        theme_bw(base_size = 14) +
+        theme(
+          text = element_text(family = "sans"),
+          plot.title = element_text(size = 17, hjust = 0.5, face = "bold", margin = margin(b = 6), color = "#111827"),
+          plot.subtitle = element_text(size = 12.5, hjust = 0.5, color = "#4B5563", margin = margin(b = 16)),
+          plot.caption = element_text(size = 10.5, color = "#6B7280", hjust = 0.5, margin = margin(t = 12)),
+          axis.title.x = element_text(size = 14, face = "bold", color = "#1F2937", margin = margin(t = 12)),
+          axis.title.y = element_text(size = 14, face = "bold", color = "#1F2937", margin = margin(r = 12)),
+          axis.text.x = element_text(size = 13.5, face = "bold", color = "#1F2937"),
+          axis.text.y = element_text(size = 13.5, face = "bold", color = "#1F2937"),
+          legend.title = element_text(size = 12.5, face = "bold", color = "#1F2937", margin = margin(b = 8)),
+          legend.text = element_text(size = 11.5, color = "#374151"),
+          panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          panel.border = element_rect(colour = "#374151", fill = NA, linewidth = 0.8),
+          plot.margin = margin(t = 16, r = 18, b = 14, l = 16)
+        )
+      
+      png_path <- file.path(results_dir, "Confusion_Matrix_Heatmap.png")
+      ggsave(png_path, plot = p_cm, width = 7.5, height = 6.4, dpi = 300, bg = "white")
+      print(paste("Confusion matrix heatmap saved to:", png_path))
+    }
+  } else {
+    warning("Validation scoring files not detected. Please verify that human_coded_validation_loc.xlsx and llm_scored_validation_loc.xlsx exist in results_dir.")
+  }
+
+  # ------------------------------------------------------------------------------
+  # Step 8: Final Score Backfill and Data Merging (Final Data Consolidation)
+  # ------------------------------------------------------------------------------
+  print("Merging final LLM stance scores...")
+  remaining_llm_path <- file.path(results_dir, "llm_scored_remaining_loc.xlsx")
+
+  if (file.exists(remaining_llm_path) && file.exists(val_llm_path)) {
+    llm_remaining <- read_excel(remaining_llm_path) %>% select(Doc_ID, LLM_Score)
+    llm_val <- read_excel(val_llm_path) %>% select(Doc_ID, LLM_Score)
+    all_llm_scores <- bind_rows(llm_val, llm_remaining)
+    df_final <- meta_for_llm_full %>%
+      inner_join(all_llm_scores, by = "Doc_ID") %>%
+      mutate(Final_Stance = as.numeric(LLM_Score)) %>%
+      filter(!is.na(Final_Stance), Final_Stance != -99)
+    print(paste("Successfully merged final dataset. After excluding missing scores and non-applicable targets (-99), valid regression sample size is:", nrow(df_final)))
+  } else {
+    stop("Final scoring files missing. Please verify that llm_scored_remaining_loc.xlsx and llm_scored_validation_loc.xlsx are generated.")
+  }
+} else {
+  print(paste("=== Robustness Resampling Mode (Seed", current_seed, ") ==="))
+  export_remaining_data <- meta_for_llm_full %>% select(Doc_ID, Title, Text)
+  full_sample_path <- file.path(results_dir, paste0("full_sample_for_llm_seed_", current_seed, ".xlsx"))
+  write_xlsx(export_remaining_data, full_sample_path)
+  print(paste("Full sample (", nrow(export_remaining_data), "articles) saved to:", full_sample_path))
+  
+  # Step 8: Robustness Sample Full Score Backfill and Data Merging
+  print("Reading robustness LLM scoring results for final data consolidation...")
+  llm_final_path <- file.path(results_dir, paste0("llm_scored_full_seed_", current_seed, ".xlsx"))
+  if (file.exists(llm_final_path)) {
+    llm_remaining <- read_excel(llm_final_path) %>% select(Doc_ID, LLM_Score)
+    df_final <- meta_for_llm_full %>%
+      inner_join(llm_remaining, by = "Doc_ID") %>%
+      mutate(Final_Stance = as.numeric(LLM_Score)) %>%
+      filter(!is.na(Final_Stance), Final_Stance != -99)
+    print(paste("Successfully merged robustness sample data. After excluding missing scores and non-applicable targets (-99), valid regression sample size is:", nrow(df_final)))
+  } else {
+    stop(paste("Robustness scoring file not found:", llm_final_path))
+  }
+}
+
+# Factor preprocessing: Explicitly set comparison baseline for funding sources
+df_final$Funding_Sources <- as.factor(df_final$Funding_Sources)
+if ("Other Sources" %in% levels(df_final$Funding_Sources)) {
+  df_final$Funding_Sources <- relevel(df_final$Funding_Sources, ref = "Other Sources")
+}
+
+# ------------------------------------------------------------------------------
+# Step 9: Baseline Topic Diagnostics and Automated Selection
+# ------------------------------------------------------------------------------
+print("Initiating baseline topic diagnostic procedure...")
+
+topic_diagnostics <- data.frame(
+  Topic_Num = 1:K_selected,
+  Mean_Prevalence = numeric(K_selected), # Global topic prevalence
+  P_Value_Diff = numeric(K_selected),    # P-value of distribution difference across media groups
+  T_Stat_Diff = numeric(K_selected)      # Absolute t-statistic of group difference
+)
+
+for (i in 1:K_selected) {
+  topic_col <- paste0("Topic_", i)
+  
+  # a. Calculate mean prevalence of this topic across all documents
+  topic_diagnostics$Mean_Prevalence[i] <- mean(df_final[[topic_col]], na.rm = TRUE)
+  
+  # b. Run bivariate regression to test significance
+  temp_formula <- as.formula(paste(topic_col, "~ Funding_Sources"))
+  temp_summary <- summary(lm(temp_formula, data = df_final))
+  
+  # c. Extract Funding_Sources coefficient statistics (p-value and t-statistic)
+  coef_row_idx <- grep("Funding_Sources", rownames(temp_summary$coefficients))
+  
+  if(length(coef_row_idx) > 0) {
+    topic_diagnostics$P_Value_Diff[i] <- temp_summary$coefficients[coef_row_idx, 4]
+    topic_diagnostics$T_Stat_Diff[i] <- abs(temp_summary$coefficients[coef_row_idx, 3])
+  } else {
+    topic_diagnostics$P_Value_Diff[i] <- NA
+    topic_diagnostics$T_Stat_Diff[i] <- NA
+  }
+}
+
+# Sort by agenda balance (higher p-value indicates smaller inter-group agenda difference, more suitable as baseline)
+topic_diagnostics <- topic_diagnostics %>% arrange(desc(P_Value_Diff))
+
+print("=== Baseline Topic Candidate Ranking (Descending by P-value) ===")
+print(topic_diagnostics %>%
+  rename(Thema = Topic_Num, `Mittlerer Themenanteil` = Mean_Prevalence,
+         `p-Wert des Gruppenunterschieds` = P_Value_Diff,
+         `Absoluter t-Wert` = T_Stat_Diff))
+
+if (current_seed == "42") {
+  # Set threshold: Filter balanced topics with mean prevalence > 5%, select top-ranked topic as baseline
+  candidate_topics <- topic_diagnostics %>% filter(Mean_Prevalence > 0.05)
+  optimal_baseline_num <- candidate_topics$Topic_Num[1]
+} else {
+  # Robustness check: Find most balanced control topic not significantly associated with covariates
+  p_values_df <- data.frame(Topic = paste0("Topic_", seq_len(K_selected)), Max_P_Value = NA_real_)
+  for (i in seq_len(K_selected)) {
+    topic_name <- paste0("Topic_", i)
+    f <- as.formula(paste(topic_name, "~ Funding_Sources + Is_Taiwan"))
+    m <- lm(f, data = df_final)
+    p_values_df$Max_P_Value[i] <- max(summary(m)$coefficients[-1, 4])
+  }
+  candidate_topics <- p_values_df %>% arrange(desc(Max_P_Value)) %>%
+    mutate(Topic_Num = as.numeric(gsub("Topic_", "", Topic)))
+  optimal_baseline_num <- candidate_topics$Topic_Num[1]
+}
+
+print(paste("Selected optimal baseline topic according to statistical criteria: Topic", optimal_baseline_num))
+
+# Construct dynamic control topics formula string (excluding selected baseline topic)
+control_topics_nums <- setdiff(1:K_selected, optimal_baseline_num)
+control_topics_formula_str <- paste(paste0("Topic_", control_topics_nums), collapse = " + ")
+
+# ------------------------------------------------------------------------------
+# Step 10: Regression Analysis and Model Comparison
+# ------------------------------------------------------------------------------
+# --- [Model 1: Baseline Model (Basismodell)] ---
+formula_p1 <- as.formula("Final_Stance ~ Funding_Sources + Is_Taiwan")
+model_p1 <- lm(formula_p1, data = df_final)
+
+print("=== Model 1: Baseline Main Effect Regression Results ===")
+print_model_de(summary(model_p1))
+
+# --- [Model 2: Structural Topic Confounder Control Model (Themenkontrolle)] ---
+formula_p2 <- as.formula(paste("Final_Stance ~ Funding_Sources + Is_Taiwan +", control_topics_formula_str))
+model_p2 <- lm(formula_p2, data = df_final)
+
+print("=== Model 2: Confounder-Controlled Regression Results ===")
+print_model_de(summary(model_p2))
+
+# --- [Model Comparison: Adjusted R² Comparison between M1 and M2] ---
+adj_r2_m1 <- summary(model_p1)$adj.r.squared
+adj_r2_m2 <- summary(model_p2)$adj.r.squared
+
+cat("=== Vergleich des korrigierten R² zwischen Modell 1 und Modell 2 ===\n")
+cat(sprintf("Modell 1 (Basismodell M1) Korrigiertes R²: %.4f (R²: %.4f)\n", adj_r2_m1, summary(model_p1)$r.squared))
+cat(sprintf("Modell 2 (Themenkontrolle M2) Korrigiertes R²: %.4f (R²: %.4f)\n", adj_r2_m2, summary(model_p2)$r.squared))
+cat(sprintf("Δ Korrigiertes R² (M2 - M1): %.4f (Δ R²: %.4f)\n", adj_r2_m2 - adj_r2_m1, summary(model_p2)$r.squared - summary(model_p1)$r.squared))
+
+# ------------------------------------------------------------------------------
+# Step 11: High-Quality Academic Visualizations (Standard Plots)
+# ------------------------------------------------------------------------------
+# [Figure 1] Model 1: Unadjusted Media Stance Difference (without topic controls)
+pred_m1_df <- as.data.frame(ggpredict(model_p1, terms = "Funding_Sources")) %>%
+  mutate(x = factor(x, levels = c("Other Sources", "Foreign Gov-Affiliated"), 
+                    labels = c("Medien mit anderen\nFinanzierungsquellen", "Staatlich bzw. öffentlich\nfinanzierte Medien")))
+
+plot_m1 <- ggplot(pred_m1_df, aes(x = x, y = predicted)) +
+  geom_pointrange(aes(ymin = conf.low, ymax = conf.high), color = "#5E8B7E", size = 1.3, fatten = 4) +
+  labs(
+    title = "Modell 1: Vorhergesagter Stance-Wert nach Finanzierungsquelle",
+    subtitle = "Basismodell M1 (ohne Kontrolle der Themenzusammensetzung)",
+    x = "",
+    y = "Vorhergesagter Haltungswert [−1, +1]"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    text = element_text(family = "sans"),
+    plot.background = element_rect(fill = "white", colour = NA),
+    panel.background = element_rect(fill = "white", colour = NA),
+    panel.grid.major.y = element_line(color = "grey90", linewidth = 0.5),
+    panel.grid.minor.y = element_blank(),
+    panel.grid.major.x = element_line(color = "grey92", linewidth = 0.5),
+    plot.title = element_text(face = "bold", hjust = 0.5, size = 15.5, margin = margin(b = 6)),
+    plot.subtitle = element_text(hjust = 0.5, size = 13, color = "grey35", margin = margin(b = 18)),
+    axis.title.y = element_text(face = "bold", size = 13, margin = margin(r = 15)),
+    axis.text.x = element_text(size = 12, face = "bold", color = "black", lineheight = 1.2),
+    axis.text.y = element_text(size = 11.5, face = "bold", color = "black"),
+    plot.margin = margin(t = 20, r = 25, b = 20, l = 20)
+  )
+ggsave(file.path(results_dir, "Path1_Model1_Predicted_Stance_loc.png"), plot = plot_m1, width = 8.5, height = 6, dpi = 300, bg = "white")
+
+# [Figure 2] Model 2: Adjusted Media Stance Difference (controlling for structural topics)
+pred_m2_df <- as.data.frame(ggpredict(model_p2, terms = "Funding_Sources")) %>%
+  mutate(x = factor(x, levels = c("Other Sources", "Foreign Gov-Affiliated"), 
+                    labels = c("Medien mit anderen\nFinanzierungsquellen", "Staatlich bzw. öffentlich\nfinanzierte Medien")))
+
+plot_m2 <- ggplot(pred_m2_df, aes(x = x, y = predicted)) +
+  geom_pointrange(aes(ymin = conf.low, ymax = conf.high), color = "#5E8B7E", size = 1.3, fatten = 4) +
+  labs(
+    title = "Modell 2: Bereinigter Stance-Wert nach Finanzierungsquelle",
+    subtitle = "Modell M2 (mit Kontrolle der Themenzusammensetzung)",
+    x = "",
+    y = "Vorhergesagter Haltungswert [−1, +1]"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    text = element_text(family = "sans"),
+    plot.background = element_rect(fill = "white", colour = NA),
+    panel.background = element_rect(fill = "white", colour = NA),
+    panel.grid.major.y = element_line(color = "grey90", linewidth = 0.5),
+    panel.grid.minor.y = element_blank(),
+    panel.grid.major.x = element_line(color = "grey92", linewidth = 0.5),
+    plot.title = element_text(face = "bold", hjust = 0.5, size = 15.5, margin = margin(b = 6)),
+    plot.subtitle = element_text(hjust = 0.5, size = 13, color = "grey35", margin = margin(b = 18)),
+    axis.title.y = element_text(face = "bold", size = 13, margin = margin(r = 15)),
+    axis.text.x = element_text(size = 12, face = "bold", color = "black", lineheight = 1.2),
+    axis.text.y = element_text(size = 11.5, face = "bold", color = "black"),
+    plot.margin = margin(t = 20, r = 25, b = 20, l = 20)
+  )
+ggsave(file.path(results_dir, "Path2_Model2_Predicted_Stance_loc.png"), plot = plot_m2, width = 8.5, height = 6, dpi = 300, bg = "white")
+
+# [Figure 3] Finanzierungsgruppenvergleich vor und nach Themenkontrolle
+# BEGIN FUNDING_COEFFICIENT_SLOPE
+# Finanzierungsgruppenvergleich vor und nach Themenkontrolle.
+# Alle Beschriftungen und Unsicherheiten werden aus den uebergebenen Modellen abgeleitet.
+make_funding_coefficient_plot <- function(model_m1, model_m2) {
+  term <- "Funding_SourcesForeign Gov-Affiliated"
+  extract <- function(model, model_id, x) {
+    sm <- summary(model)
+    if (sum(rownames(sm$coefficients) == term) != 1L) {
+      stop("Der Finanzierungskoeffizient fehlt oder ist nicht eindeutig.")
+    }
+    ci <- stats::confint(model, parm = term, level = 0.95)
+    data.frame(
+      model = model_id, x = x, estimate = unname(stats::coef(model)[term]),
+      conf_low = ci[1, 1], conf_high = ci[1, 2],
+      p_value = sm$coefficients[term, "Pr(>|t|)"],
+      n_articles = stats::nobs(model), adjusted_r2 = sm$adj.r.squared,
+      row.names = NULL
+    )
+  }
+  dat <- rbind(extract(model_m1, "M1", 1), extract(model_m2, "M2", 2))
+  stopifnot(
+    identical(rownames(stats::model.frame(model_m1)), rownames(stats::model.frame(model_m2))),
+    dat$n_articles[1] == dat$n_articles[2],
+    all(is.finite(as.matrix(dat[, c("estimate", "conf_low", "conf_high", "p_value")]))),
+    all(dat$conf_low < dat$estimate), all(dat$estimate < dat$conf_high),
+    all((dat$p_value < 0.05) == (dat$conf_low > 0 | dat$conf_high < 0))
+  )
+  decimal <- function(x, digits = 4, signed = FALSE) {
+    fmt <- paste0(if (signed) "%+." else "%.", digits, "f")
+    gsub(".", ",", sprintf(fmt, x), fixed = TRUE)
+  }
+  topic_count <- sum(grepl("^Topic_", names(stats::coef(model_m2))))
+  sample_label <- format(dat$n_articles[1], big.mark = ".", decimal.mark = ",", scientific = FALSE, trim = TRUE)
+  font_family <- if (requireNamespace("systemfonts", quietly = TRUE) &&
+                     "Arial" %in% systemfonts::system_fonts()$family) "Arial" else "sans"
+  dat$estimate_label <- decimal(dat$estimate, signed = TRUE)
+  dat$ci_label <- paste0("[", decimal(dat$conf_low), "; ", decimal(dat$conf_high), "]")
+  dat$p_label <- ifelse(dat$p_value < 0.001, "p < 0,001", paste0("p = ", decimal(dat$p_value, 3)))
+  dat$label_x <- c(0.90, 2.10)
+  dat$hjust <- c(1, 0)
+  dat$estimate_y <- dat$estimate + c(0.014, 0.001)
+  dat$ci_y <- dat$estimate + c(-0.009, -0.022)
+  dat$p_y <- dat$estimate + c(-0.032, -0.045)
+  # Bei einem positiven M2-Koeffizienten steht der ganze Textblock oberhalb der Nulllinie.
+  # So kann die Referenzlinie keine der drei Zahlenbeschriftungen kreuzen.
+  if (dat$estimate[2] > 0) {
+    dat$p_y[2] <- max(0.015, dat$p_y[2])
+    dat$ci_y[2] <- dat$p_y[2] + 0.023
+    dat$estimate_y[2] <- dat$ci_y[2] + 0.023
+  }
+  y_limits <- c(
+    min(-0.10, floor((min(dat$conf_low, dat$p_y) - 0.015) / 0.05) * 0.05),
+    max(0.25, ceiling((max(dat$conf_high, dat$estimate_y) + 0.015) / 0.05) * 0.05)
+  )
+  footnote <- paste0(
+    "Beide Modelle kontrollieren die Taiwan-Zuordnung.\n",
+    "95%-Konfidenzintervalle; zweiseitige t-Tests (OLS). 0 = kein Gruppenunterschied.\n",
+    "Korr. R²: M1 = ", decimal(dat$adjusted_r2[1]), "; M2 = ", decimal(dat$adjusted_r2[2]),
+    "; Differenz = ", decimal(diff(dat$adjusted_r2), signed = TRUE), "."
+  )
+  plot <- ggplot2::ggplot(dat, ggplot2::aes(x = x, y = estimate)) +
+    ggplot2::geom_hline(yintercept = 0, colour = "#9299A1", linewidth = 0.50, linetype = "dashed") +
+    ggplot2::geom_line(ggplot2::aes(group = 1), colour = "#1B7A60", linewidth = 1.0, alpha = 0.72) +
+    ggplot2::geom_errorbar(ggplot2::aes(ymin = conf_low, ymax = conf_high, colour = model), width = 0.055, linewidth = 0.90) +
+    ggplot2::geom_point(ggplot2::aes(colour = model, shape = model), size = 3.7, stroke = 0.8) +
+    ggplot2::geom_text(ggplot2::aes(x = label_x, y = estimate_y, label = estimate_label, hjust = hjust),
+                       colour = "#17212B", family = font_family, fontface = "bold", size = 3.55) +
+    ggplot2::geom_text(ggplot2::aes(x = label_x, y = ci_y, label = ci_label, hjust = hjust),
+                       colour = "#34414D", family = font_family, size = 2.95) +
+    ggplot2::geom_text(ggplot2::aes(x = label_x, y = p_y, label = p_label, hjust = hjust),
+                       colour = "#596573", family = font_family, size = 2.95) +
+    ggplot2::scale_colour_manual(values = c(M1 = "#596573", M2 = "#1B7A60")) +
+    ggplot2::scale_shape_manual(values = c(M1 = 16, M2 = 17)) +
+    ggplot2::scale_x_continuous(
+      limits = c(0.30, 2.70), breaks = c(1, 2), expand = c(0, 0),
+      labels = c("M1: Basismodell\nOhne Themenkontrolle",
+                 paste0("M2: Themenkontrolle\nMit ", topic_count, " STM-Themenanteilen"))
+    ) +
+    ggplot2::scale_y_continuous(
+      limits = y_limits, breaks = seq(y_limits[1], y_limits[2], by = 0.05),
+      expand = c(0, 0), labels = function(x) decimal(x, digits = 2)
+    ) +
+    ggplot2::labs(
+      title = "Finanzierungsgruppe und mediale Haltung",
+      subtitle = paste0(
+        "Staatlich / öffentlich finanzierte Medien minus Medien mit anderen Finanzierungsquellen\n",
+        "Gruppendifferenz im Stance-Wert  -  N = ", sample_label, " Artikel"
+      ),
+      x = NULL, y = "Unstandardisierter OLS-Koeffizient b", caption = footnote
+    ) +
+    ggplot2::guides(colour = "none", shape = "none") +
+    ggplot2::theme_classic(base_size = 9, base_family = font_family) +
+    ggplot2::theme(
+      plot.title.position = "plot", plot.caption.position = "plot",
+      plot.title = ggplot2::element_text(size = 12, face = "bold", colour = "#17212B", margin = ggplot2::margin(b = 5)),
+      plot.subtitle = ggplot2::element_text(size = 8.3, colour = "#596573", lineheight = 1.25, margin = ggplot2::margin(b = 15)),
+      axis.title.y = ggplot2::element_text(size = 8.6, colour = "#263440", margin = ggplot2::margin(r = 9)),
+      axis.text.y = ggplot2::element_text(size = 8.5, colour = "#34414D", margin = ggplot2::margin(r = 4)),
+      axis.text.x = ggplot2::element_text(size = 9.1, colour = "#263440", lineheight = 1.2, margin = ggplot2::margin(t = 8)),
+      axis.line = ggplot2::element_line(colour = "#53606C", linewidth = 0.35),
+      axis.ticks = ggplot2::element_line(colour = "#53606C", linewidth = 0.35),
+      axis.ticks.length = grid::unit(1.3, "mm"),
+      plot.caption = ggplot2::element_text(size = 7.5, colour = "#596573", hjust = 0, lineheight = 1.3, margin = ggplot2::margin(t = 12)),
+      plot.margin = ggplot2::margin(t = 12, r = 13, b = 10, l = 12),
+      panel.grid = ggplot2::element_blank(),
+      plot.background = ggplot2::element_rect(fill = "white", colour = NA)
+    )
+  list(plot = plot, data = dat, font_family = font_family)
+}
+
+save_funding_coefficient_plot <- function(result, output_dir,
+                                         stem = "Path1_2_Coefficient_Comparison_loc",
+                                         width_mm = 160, height_mm = 110, dpi = 600) {
+  for (package in c("ggplot2", "ragg", "svglite")) {
+    if (!requireNamespace(package, quietly = TRUE)) {
+      stop("Fehlendes R-Paket: ", package, ". Bitte mit install.packages() installieren.")
+    }
+  }
+  dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+  output <- file.path(output_dir, stem)
+  # Showtext-Hooks temporaer entfernen, damit Vektortext editierbar bleibt.
+  hook_names <- c("plot.new", "grid.newpage")
+  old_hooks <- lapply(hook_names, getHook)
+  names(old_hooks) <- hook_names
+  on.exit(for (name in hook_names) setHook(name, old_hooks[[name]], action = "replace"), add = TRUE)
+  for (name in hook_names) {
+    keep <- !vapply(old_hooks[[name]], inherits, logical(1), "showtext_hook")
+    setHook(name, old_hooks[[name]][keep], action = "replace")
+  }
+  draw <- function(open_device) {
+    open_device()
+    on.exit(grDevices::dev.off(), add = TRUE)
+    print(result$plot)
+  }
+  draw(function() grDevices::cairo_pdf(paste0(output, ".pdf"), width = width_mm / 25.4,
+                                      height = height_mm / 25.4, family = result$font_family))
+  draw(function() svglite::svglite(paste0(output, ".svg"), width = width_mm / 25.4, height = height_mm / 25.4))
+  draw(function() ragg::agg_png(paste0(output, ".png"), width = width_mm, height = height_mm,
+                               units = "mm", res = dpi, background = "white"))
+  draw(function() ragg::agg_tiff(paste0(output, ".tiff"), width = width_mm, height = height_mm,
+                                units = "mm", res = dpi, background = "white", compression = "lzw"))
+  utils::write.csv(result$data, paste0(output, "_source_data.csv"), row.names = FALSE)
+  invisible(result)
+}
+
+funding_coef_result <- make_funding_coefficient_plot(model_p1, model_p2)
+combined_tidy <- funding_coef_result$data
+plot_coef <- funding_coef_result$plot
+save_funding_coefficient_plot(funding_coef_result, results_dir)
+# END FUNDING_COEFFICIENT_SLOPE
+print("Regression visualization plots successfully saved.")
+
+# [Figure 4] Vollstaendiges Forest-Table-Diagramm: Modell 1 vs. Modell 2
+# ------------------------------------------------------------------------------
+# Gemeinsame Routine aus dem Replikationspaket; keine privaten absoluten Pfade.
+locate_forest_helper <- function() {
+  file_arg <- grep("^--file=", commandArgs(FALSE), value = TRUE)
+  input_files <- c(sub("^--file=", "", file_arg), vapply(sys.frames(), function(frame) {
+    if (is.null(frame$ofile)) "" else as.character(frame$ofile[1])
+  }, character(1)))
+  candidates <- c(
+    file.path(dirname(input_files[nzchar(input_files)]), "full_model_forest_plot.R"),
+    file.path(getwd(), "scripts", "03_main_pipeline", "full_model_forest_plot.R"),
+    file.path(getwd(), "Replication_Package", "scripts", "03_main_pipeline", "full_model_forest_plot.R"),
+    file.path(getwd(), "full_model_forest_plot.R")
+  )
+  found <- candidates[file.exists(candidates)]
+  if (!length(found)) stop("full_model_forest_plot.R im Replikationspaket nicht gefunden.")
+  normalizePath(found[1])
+}
+forest_helper <- locate_forest_helper()
+source(forest_helper)
+forest_topic_csv <- file.path(dirname(forest_helper), "..", "..", "data", "derived", "stm",
+                              paste0("seed_", current_seed), "topic_names.csv")
+forest_topic_excel <- file.path(results_dir, paste0("topic_summaries_loc_", current_seed, ".xlsx"))
+if (file.exists(forest_topic_excel)) {
+  forest_topic_names <- readxl::read_excel(forest_topic_excel)
+} else if (file.exists(forest_topic_csv)) {
+  forest_topic_names <- read.csv(forest_topic_csv, fileEncoding = "UTF-8")
+} else {
+  stop("Themenbezeichnungen fuer den aktuellen Seed fehlen.")
+}
+forest_result <- make_full_model_forest_plot(model_p1, model_p2, forest_topic_names, current_seed)
+plot_forest_table <- forest_result$plot
+save_full_model_forest_plot(forest_result, results_dir)
+print("Vollstaendiger Forest-Plot fuer den aktuellen Seed gespeichert.")
+
+# ------------------------------------------------------------------------------
+# Step 12: Save Core Workspace and Environment Configuration
+# ------------------------------------------------------------------------------
+save(
+  stm_model, out, docs, vocab, meta, all_articles, effect, summary_effect, plot_data, search_k_result, K_selected,
+  model_p1, model_p2, df_final, optimal_baseline_num,
+  final_results, top_20_df_de, sorted_frex_df_de,
+  p_to_tweak, prevalence_plot, plot_m1, plot_m2, plot_coef, plot_forest_table,
+  file = file.path(results_dir, paste0(current_seed, ".RData"))
+)
+writeLines(capture.output(sessionInfo()), file.path(results_dir, "sessionInfo.txt"))
+print(paste("Core STM analysis and regression objects saved to:", file.path(results_dir, paste0(current_seed, ".RData"))))
+print("Full analytical pipeline executed successfully.")

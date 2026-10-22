@@ -1,0 +1,11 @@
+{
+  "provider": "Google Cloud Vertex AI",
+  "model_id": "gemini-3.5-flash-lite",
+  "generation_config": {
+    "temperature": 0.0,
+    "top_p": 0.2,
+    "response_mime_type": "application/json"
+  },
+  "inference_mode": "Batch Prediction (asynchronous)",
+  "system_instruction": "You are an expert academic coder for quantitative content analysis in communication research. Your task is to conduct 'Entity-Level Stance Analysis' on overseas Chinese media articles. Strictly follow the codebook instructions and output ONLY valid JSON."
+}

@@ -1,0 +1,4 @@
+"Task","N","Alpha","Accuracy"
+"Joint labels (nominal)",100,0.759827586206897,0.86
+"Target applicability (nominal)",100,0.889444444444444,0.98
+"Stance, both applicable (nominal)",89,0.727692307692308,0.865168539325843

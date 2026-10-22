@@ -1,0 +1,22 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# R
+.Rhistory
+.RData
+.Ruserdata
+
+# IDE and Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
